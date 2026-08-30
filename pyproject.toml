@@ -1,0 +1,39 @@
+# The `petabyte` CLI — the public, MIT-licensed client for the Petabyte GPU marketplace.
+#
+# GENERATED from the main repo by scripts/build_cli_package.py — do not hand-edit here; edit the
+# source (lumaris_api/cli/petabyte.py + lumaris_api/modelhub/) in the main repo and let the mirror
+# regenerate this. Flat layout: petabyte.py + modelhub/ live at the repo root.
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "petabyte-client"
+version = "0.1.0"
+description = "Petabyte CLI — rent verified GPU compute, launch apps, and pull AI models from your terminal."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Petabyte, Inc." }]
+keywords = ["gpu", "compute", "cloud", "marketplace", "cli", "ai", "models"]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = ["httpx>=0.24"]
+
+[project.urls]
+Homepage = "https://petabyte.market"
+Documentation = "https://petabyte.market/wiki"
+Source = "https://github.com/BDR-Pro/petabyte-client"
+
+[project.scripts]
+petabyte = "petabyte:main"
+
+[tool.setuptools]
+py-modules = ["petabyte"]
+packages = ["modelhub", "modelhub.providers"]
+license-files = ["LICENSE"]

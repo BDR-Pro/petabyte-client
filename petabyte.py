@@ -1,0 +1,430 @@
+#!/usr/bin/env python3
+"""Petabyte CLI — book GPU compute and run a notebook in one command.
+
+  petabyte register -u alice -p secret
+  petabyte login    -u alice -p secret
+  petabyte deposit 100
+  petabyte specs
+  petabyte launch ollama --hours 2
+  petabyte run notebook.ipynb --gpu H100 --hours 1
+  petabyte wallet
+"""
+import argparse
+import json
+import os
+import sys
+import time
+
+import httpx
+import os as _os
+
+# The model hub (discover/pull/manage models) lives in the sibling `modelhub` package. Make it
+# importable whether the CLI is run as `python cli/petabyte.py` or installed as `petabyte`.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+try:
+    from modelhub import cli as mh_cli
+except Exception:  # noqa: BLE001 — model commands are optional; the compute CLI still works without
+    mh_cli = None
+
+_TTY = hasattr(__import__("sys").stdout, "isatty") and __import__("sys").stdout.isatty() and not _os.getenv("NO_COLOR")
+def _c(txt, code):
+    return f"\033[{code}m{txt}\033[0m" if _TTY else txt
+def _amber(t): return _c(t, "38;5;214")
+def _cyan(t): return _c(t, "38;5;44")
+def _green(t): return _c(t, "38;5;42")
+def _dim(t): return _c(t, "2")
+def _bold(t): return _c(t, "1")
+
+CONFIG = os.getenv("PETABYTE_CONFIG") or os.path.expanduser("~/.petabyte/cli.json")
+DEFAULT_API = os.getenv("PETABYTE_API_URL", "http://localhost:8000")
+
+
+def _cfg():
+    try:
+        return json.load(open(CONFIG))
+    except Exception:
+        return {"api_url": DEFAULT_API, "token": None}
+
+
+def _save(cfg):
+    d = os.path.dirname(CONFIG)
+    if d:                                   # a bare filename (e.g. PETABYTE_CONFIG=cli.json) has no dir
+        os.makedirs(d, exist_ok=True)
+    json.dump(cfg, open(CONFIG, "w"))
+
+
+def _client(cfg, auth=True):
+    headers = {}
+    if auth and cfg.get("token"):
+        headers["Authorization"] = f"Bearer {cfg['token']}"
+    return httpx.Client(base_url=cfg["api_url"], headers=headers, timeout=30)
+
+
+def _die(msg, r=None):
+    if r is not None:
+        msg += f" ({r.status_code}: {r.text[:200]})"
+    print(f"error: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def cmd_register(a, cfg):
+    with _client(cfg, auth=False) as c:
+        r = c.post("/register_user", json={"username": a.username, "password": a.password})
+    print("registered" if r.status_code == 200 else _die("register failed", r))
+
+
+def cmd_login(a, cfg):
+    with _client(cfg, auth=False) as c:
+        r = c.post("/login", data={"username": a.username, "password": a.password})
+    if r.status_code != 200:
+        _die("login failed", r)
+    cfg["token"] = r.json()["access_token"]
+    _save(cfg)
+    print("logged in")
+
+
+def cmd_deposit(a, cfg):
+    with _client(cfg) as c:
+        r = c.post("/deposit", json={"amount": a.amount})
+    print(f"balance: ${r.json()['balance']}" if r.status_code == 200 else _die("deposit failed", r))
+
+
+def cmd_wallet(a, cfg):
+    with _client(cfg) as c:
+        r = c.get("/wallet")
+    if r.status_code != 200:
+        _die("wallet failed", r)
+    w = r.json()
+    print(f"balance:  ${w['balance']}\nearnings: ${w['earnings']}")
+
+
+def cmd_specs(a, cfg):
+    with _client(cfg) as c:
+        r = c.get("/specs")
+    if r.status_code != 200:
+        _die("specs failed", r)
+    specs = r.json()["specs"]
+    if not specs:
+        print("no bookable GPUs available right now")
+        return
+    print(_dim(f"  {'ID':>3}  {'GPU':<10} {'$/HR':>7}  {'UNITS':>5}  {'REP':>3}  PROVIDER"))
+    for sp in specs:
+        rep = sp.get("reputation_score", sp.get("reputation"))
+        tags = []
+        if sp.get("confidential"): tags.append(_amber("confidential"))
+        if sp.get("region_verified"): tags.append(_cyan("region\u2713"))
+        line = (f"  {sp['spec_id']:>3}  {_bold(str(sp['gpu_model'] or 'CPU')):<10} "
+                f"{_amber('$'+format(sp['price_per_hour'],'.2f')):>7}  "
+                f"{sp['available_units']:>5}  {rep:>3}  {sp['provider']}")
+        print(line + ("  " + " ".join(tags) if tags else ""))
+
+
+def _read_code(path):
+    if path.endswith(".ipynb"):
+        nb = json.load(open(path))
+        cells = [c for c in nb.get("cells", []) if c.get("cell_type") == "code"]
+        return "\n\n".join("".join(c.get("source", [])) for c in cells)
+    return open(path).read()
+
+
+def cmd_run(a, cfg):
+    code = _read_code(a.file)
+    with _client(cfg) as c:
+        # pick a spec
+        spec_id = a.spec
+        if not spec_id:
+            sr = c.get("/specs")
+            if sr.status_code != 200:       # e.g. 401/5xx — don't .json() a non-OK body
+                _die("could not list GPUs", sr)
+            specs = sr.json().get("specs", [])
+            if a.gpu:
+                specs = [s for s in specs if (s["gpu_model"] or "").lower() == a.gpu.lower()]
+            if not specs:
+                _die("no matching GPU available")
+            spec_id = specs[0]["spec_id"]   # cheapest (list is price-sorted)
+            print(_dim(f"→ selected spec {spec_id} ({specs[0]['gpu_model']} @ ${specs[0]['price_per_hour']}/hr)"))
+        # book (optionally on a private WireGuard VPN — the buyer chooses)
+        want_vpn = bool(getattr(a, "vpn", False))
+        r = c.post("/request_vm", json={"spec_id": spec_id, "hours": a.hours, "vpn": want_vpn})
+        if r.status_code != 200:
+            _die("booking failed", r)
+        bk = r.json()
+        print(f"booked #{bk['booking_id']}  escrow ${bk['gross_amount']} "
+              f"(fee ${bk['platform_fee']}, seller ${bk['seller_payout']})")
+        if want_vpn and bk.get("vpn_config_url"):
+            cr = c.get(bk["vpn_config_url"])
+            if cr.status_code == 200:
+                path = f"petabyte-{bk['booking_id']}.conf"
+                with open(path, "w") as f:
+                    f.write(cr.text)
+                print(_green(f"✓ VPN config written to {path}") +
+                      _dim(f"  → connect with:  sudo wg-quick up ./{path}"))
+            else:
+                print(_amber("! could not fetch VPN config (booking still active)"))
+        # create task
+        r = c.post("/create_task", json={"booking_id": bk["booking_id"],
+                                         "task_type": "notebook", "code": code})
+        if r.status_code != 200:
+            _die("task creation failed", r)
+        tid = r.json()["task_id"]
+        print(f"dispatched task #{tid} — waiting for a node to execute...")
+        # poll
+        deadline = time.time() + a.timeout
+        while time.time() < deadline:
+            t = c.get(f"/tasks/{tid}").json()
+            if t["status"] in ("completed", "failed"):
+                hdr = _green("\u2713 COMPLETED") if t["status"]=="completed" else _amber("\u2717 FAILED")
+                print(f"\n{hdr}")
+                print(t.get("result") or "(no output)")
+                return
+            time.sleep(2)
+        print("timed out waiting for result", file=sys.stderr)
+
+
+def cmd_launch(a, cfg):
+    """Launch a ready-made template (ollama, comfyui, blender, minecraft, …) on the cheapest
+    verified GPU that fits — the CLI twin of the web one-click launcher (`POST /launch`)."""
+    body = {"template": a.template, "hours": a.hours}
+    if getattr(a, "max_price", None) is not None:
+        body["max_price_per_hour"] = a.max_price
+    if getattr(a, "region", None):
+        body["region"] = a.region
+    if getattr(a, "spec", None):
+        body["spec_id"] = str(a.spec)
+    with _client(cfg) as c:
+        r = c.post("/launch", json=body)
+        if r.status_code != 200:
+            _die("launch failed", r)
+        d = r.json()
+        print(_green("✓ launched ") + _bold(a.template) +
+              _dim(f"  · {d.get('gpu_model', '?')} @ ${d.get('price_per_hour', '?')}/hr · {a.hours}h"))
+        print(f"  booking #{d.get('booking_id')}   escrow ${d.get('gross_amount')}")
+        if d.get("routing_explanation"):
+            print("  " + _dim(d["routing_explanation"]))
+        url = d.get("url")
+        addr = url.get("http") if isinstance(url, dict) else url
+        if addr:
+            print("  address  " + _cyan(addr))
+        if isinstance(url, dict) and url.get("ssh"):
+            print("  ssh      " + _dim(url["ssh"]))
+        if d.get("connect"):
+            print("  " + _dim(d["connect"]))
+
+
+def cmd_ask(a, cfg):
+    """Send a prompt to the pay-per-token Inference API (OpenAI-compatible) and print the answer.
+
+    Uses an `inference`-scoped API key (not the login token): --key, else $PETABYTE_API_KEY,
+    else `api_key` in your saved config. Answer goes to stdout (pipeable); the token/cost line
+    goes to stderr."""
+    if getattr(a, "key_stdin", False):
+        key = sys.stdin.readline().strip()      # key never touches argv / shell history / ps
+    else:
+        key = a.key or os.getenv("PETABYTE_API_KEY") or cfg.get("api_key")
+    if not key:
+        _die("no inference API key — create one with scope 'inference' at /keys, then pipe it "
+             "in with --key-stdin, set PETABYTE_API_KEY, or save it as 'api_key' in your config")
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    with httpx.Client(base_url=cfg["api_url"], headers=headers, timeout=120) as c:
+        body = {"messages": [{"role": "user", "content": a.prompt}]}
+        if getattr(a, "model", None):
+            body["model"] = a.model
+        try:
+            r = c.post("/v1/chat/completions", json=body)
+        except httpx.RequestError as e:
+            _die(f"cannot reach the inference API at {cfg['api_url']} ({e.__class__.__name__})")
+        if r.status_code != 200:
+            _die("inference failed", r)
+        try:
+            j = r.json()
+        except ValueError:
+            _die("unexpected non-JSON response from the inference API", r)
+        try:
+            print(j["choices"][0]["message"]["content"])
+        except (KeyError, IndexError, TypeError):
+            _die("unexpected response from the inference API", r)
+        b = j.get("x_petabyte") or {}
+        if b.get("tokens") is not None:
+            note = f"{b.get('tokens')} tokens"
+            if b.get("charged") is not None:
+                note += f" · ${float(b.get('charged')):.6f}" + (" billed" if b.get("billed") else " (free)")
+            print(_dim("  " + note), file=sys.stderr)
+
+
+def cmd_vpn(a, cfg):
+    """Download (or re-download) the WireGuard client config for a VPN-enabled booking."""
+    with _client(cfg) as c:
+        r = c.get(f"/vpn_config/{a.booking_id}")
+        if r.status_code != 200:
+            _die("no VPN config for that booking (was it booked with --vpn?)", r)
+        path = a.out or f"petabyte-{a.booking_id}.conf"
+        with open(path, "w") as f:
+            f.write(r.text)
+        print(_green(f"✓ VPN config written to {path}"))
+        print(_dim(f"  connect:  sudo wg-quick up ./{path}      disconnect:  sudo wg-quick down ./{path}"))
+
+
+def cmd_earnings(a, cfg):
+    """Seller payout state: balance, withdrawable earnings, what's still clearing, recent payouts."""
+    with _client(cfg) as c:
+        w = c.get("/wallet")
+        if w.status_code != 200:
+            _die("wallet failed", w)
+        w = w.json()
+        pays = c.get("/wallet/payouts")
+    print(_bold("Earnings"))
+    print(f"  balance:      {_amber('$' + format(w['balance'], '.2f'))}")
+    print(f"  earnings:     ${format(w['earnings'], '.2f')}")
+    print(f"  withdrawable: {_green('$' + format(w['withdrawable'], '.2f'))}")
+    print(f"  clearing:     ${format(w['clearing'], '.2f')}  " + _dim(f"(held {w['hold_hours']}h)"))
+    print("  instant payout: " + (_green('eligible') if w.get('instant_eligible') else _dim('not yet')))
+    if pays.status_code == 200 and pays.json().get("payouts"):
+        print(_dim("\n  recent payouts:"))
+        print(_dim(f"    {'AMOUNT':>10}  {'KIND':<12} {'STATUS':<10} WHEN"))
+        for p in pays.json()["payouts"][:8]:
+            print(f"    {'$' + format(p['amount_usd'], '.2f'):>10}  {str(p['kind'])[:12]:<12} "
+                  f"{str(p['status'])[:10]:<10} {str(p['created_at'])[:10]}")
+    else:
+        print(_dim("\n  no payouts yet — add a payout method on the earnings page, then `withdraw`."))
+
+
+def _node_status(a, cfg):
+    sid = a.spec_id
+    with _client(cfg) as c:
+        dash = c.get("/seller/dashboard")
+        if dash.status_code != 200:
+            _die("dashboard failed", dash)
+        dash = dash.json()
+        models = c.get(f"/nodes/{sid}/models")
+        disk = c.get(f"/nodes/{sid}/disk")
+    node = next((n for n in dash.get("nodes", []) if n.get("spec_id") == sid), None)
+    if not node:
+        _die(f"node {sid} not found (is it one of yours?)")
+    on = _green("online") if node["online"] else _amber("offline")
+    att = _green("attested") if node["attested"] else _amber("unverified")
+    print(_bold(f"Node {sid}") + f"  {node.get('gpu_model') or 'CPU'}  [{on} · {att}]")
+    sug = _dim(f"  (suggested ${format(node['suggested_price'], '.2f')})") if node.get("suggested_price") else ""
+    print(f"  price:        ${format(node['price_per_hour'], '.2f')}/hr" + sug)
+    print(f"  units:        {node['units_busy']}/{node['units_total']} busy  ({node['utilization_pct']}% util)")
+    succ = f"  ({node['success_rate']}% success)" if node.get("success_rate") is not None else ""
+    print(f"  jobs:         {node['jobs_completed']} done · {node['jobs_failed']} failed" + succ)
+    print(f"  reputation:   {node['reputation']}")
+    print(f"  earned:       {_green('$' + format(node['earned_total'], '.2f'))}")
+    print(f"  last seen:    {node.get('last_seen') or 'never'}")
+    if models.status_code == 200:
+        ms = models.json().get("models", [])
+        if ms:
+            print(f"  models cached: {len(ms)}" + _dim("  " + ", ".join(ms[:6]) + (" …" if len(ms) > 6 else "")))
+        else:
+            print("  models cached: 0" + _dim(f"  (run: petabyte node sync-models {sid})"))
+    if disk.status_code == 200 and disk.json().get("enabled"):
+        d = disk.json()
+        print(f"  disk rental:  {d['provider']} up to {d['alloc_gb']} GB")
+    for b in [x for x in dash.get("blockers", []) if x.get("node") == node.get("id")]:
+        print(_amber("  ! " + b["issue"]) + _dim("  fix: " + b.get("fix", "")))
+
+
+def _node_sync_models(a, cfg):
+    """Scan the local ~/.petabyte model cache and report the ids to the marketplace, so the
+    scheduler prefers THIS node for jobs that need a model it already holds."""
+    try:
+        from modelhub import ModelManager
+    except Exception:  # noqa: BLE001
+        _die("model hub not available on this machine (cannot scan the local cache)")
+    ids = ModelManager().cached_model_ids()
+    with _client(cfg) as c:
+        r = c.post("/nodes/models", json={"spec_id": a.spec_id, "models": ids})
+    if r.status_code != 200:
+        _die("sync failed", r)
+    n = r.json().get("cached_models", 0)
+    print(_green(f"✓ reported {n} cached model(s)") + _dim(f" for node {a.spec_id}"))
+    for m in ids[:12]:
+        print(_dim("    " + m))
+    if not ids:
+        print(_dim("    (local cache is empty — pull a model first: petabyte model pull <id>)"))
+
+
+def cmd_node(a, cfg):
+    {"status": _node_status, "sync-models": _node_sync_models}[a.node_cmd](a, cfg)
+
+
+def main():
+    p = argparse.ArgumentParser(prog="petabyte")
+    p.add_argument("--api", help="API base URL (overrides saved config)")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("register"); s.add_argument("-u", "--username", required=True); s.add_argument("-p", "--password", required=True)
+    s = sub.add_parser("login");    s.add_argument("-u", "--username", required=True); s.add_argument("-p", "--password", required=True)
+    s = sub.add_parser("deposit");  s.add_argument("amount", type=float)
+    sub.add_parser("wallet")
+    sub.add_parser("specs")
+    s = sub.add_parser("run", help="run a notebook/.py on a rented GPU, OR start a model runtime")
+    s.add_argument("file", help="a .ipynb/.py file (compute job) OR a model id like Qwen/Qwen3-8B")
+    s.add_argument("--spec", type=int); s.add_argument("--gpu")
+    s.add_argument("--hours", type=int, default=1); s.add_argument("--timeout", type=int, default=120)
+    s.add_argument("--vpn", action="store_true",
+                   help="rent on a private WireGuard VPN and save the client config")
+    s.add_argument("--revision"); s.add_argument("--format"); s.add_argument("--quantization")
+    s.add_argument("--force", action="store_true")
+    s = sub.add_parser("launch",
+                       help="launch a ready-made template (ollama, comfyui, blender, minecraft…) on the cheapest verified GPU")
+    s.add_argument("template", help="template name, e.g. ollama, comfyui, blender, minecraft")
+    s.add_argument("--hours", type=int, default=2)
+    s.add_argument("--region")
+    s.add_argument("--max-price", type=float, dest="max_price", help="cap the $/hour you'll pay")
+    s.add_argument("--spec", type=int, help="pin to a specific host spec id")
+    s = sub.add_parser("vpn", help="download the WireGuard config for a VPN booking")
+    s.add_argument("booking_id", type=int); s.add_argument("-o", "--out")
+    s = sub.add_parser("ask", help="send a prompt to the pay-per-token Inference API and print the answer")
+    s.add_argument("prompt", help="the prompt to send")
+    s.add_argument("--model", help="model id (default: the server's default)")
+    s.add_argument("--key", help="inference API key — lands in shell history and `ps`, so prefer "
+                                 "--key-stdin / $PETABYTE_API_KEY / saved config; use only with "
+                                 "short-lived keys (e.g. CI)")
+    s.add_argument("--key-stdin", action="store_true", dest="key_stdin",
+                   help="read the API key from stdin, keeping it out of argv and shell history")
+
+    # seller: read node/payout state, and feed the model cache-locality signal
+    sub.add_parser("earnings", help="your balance, withdrawable earnings and recent payouts")
+    n = sub.add_parser("node", help="inspect a node you host")
+    ns = n.add_subparsers(dest="node_cmd", required=True)
+    st = ns.add_parser("status", help="node status: online/attested, utilization, jobs, earnings")
+    st.add_argument("spec_id", type=int)
+    sm = ns.add_parser("sync-models",
+                       help="scan the local ~/.petabyte cache and report it to the marketplace")
+    sm.add_argument("spec_id", type=int)
+
+    # model hub: discover/pull/manage AI models (Hugging Face-grade UX). Owns `model`, `pull`, `auth`;
+    # `run` is shared with the compute flow above and dispatched smartly below.
+    if mh_cli is not None:
+        mh_cli.register(sub, include=("model", "pull", "auth"))
+
+    a = p.parse_args()
+    cfg = _cfg()
+    if a.api:
+        cfg["api_url"] = a.api
+
+    if mh_cli is not None and a.cmd in ("model", "pull", "auth"):
+        sys.exit(mh_cli.handle(a) or 0)
+    if a.cmd == "run" and _is_model_ref(a.file):
+        if mh_cli is None:
+            _die("model runtime unavailable (modelhub not importable)")
+        ns = __import__("argparse").Namespace(
+            id=a.file, format=a.format, quantization=a.quantization, revision=a.revision,
+            force=a.force, home=None)
+        sys.exit(mh_cli.cmd_run(ns) or 0)
+    {"register": cmd_register, "login": cmd_login, "deposit": cmd_deposit,
+     "wallet": cmd_wallet, "specs": cmd_specs, "run": cmd_run, "launch": cmd_launch, "vpn": cmd_vpn,
+     "earnings": cmd_earnings, "node": cmd_node, "ask": cmd_ask}[a.cmd](a, cfg)
+
+
+def _is_model_ref(arg):
+    """`run` overloads a file path and a model id. A model id has a source/slug shape and is NOT an
+    existing local file or a notebook/script."""
+    if os.path.exists(arg) or arg.endswith((".ipynb", ".py")):
+        return False
+    return ("/" in arg) or (":" in arg) or arg.startswith(("hf:", "pt:", "http://", "https://"))
+
+
+if __name__ == "__main__":
+    main()
