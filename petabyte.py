@@ -181,7 +181,7 @@ def cmd_run(a, cfg):
 
 
 def cmd_launch(a, cfg):
-    """Launch a ready-made template (ollama, comfyui, blender, minecraft, …) on the cheapest
+    """Launch a ready-made template (ollama, jupyter, blender, minecraft, …) on the cheapest
     verified GPU that fits — the CLI twin of the web one-click launcher (`POST /launch`)."""
     body = {"template": a.template, "hours": a.hours}
     if getattr(a, "max_price", None) is not None:
@@ -364,8 +364,8 @@ def main():
     s.add_argument("--revision"); s.add_argument("--format"); s.add_argument("--quantization")
     s.add_argument("--force", action="store_true")
     s = sub.add_parser("launch",
-                       help="launch a ready-made template (ollama, comfyui, blender, minecraft…) on the cheapest verified GPU")
-    s.add_argument("template", help="template name, e.g. ollama, comfyui, blender, minecraft")
+                       help="launch a ready-made template (ollama, jupyter, blender, minecraft…) on the cheapest verified GPU")
+    s.add_argument("template", help="template name, e.g. ollama, jupyter, blender, minecraft")
     s.add_argument("--hours", type=int, default=2)
     s.add_argument("--region")
     s.add_argument("--max-price", type=float, dest="max_price", help="cap the $/hour you'll pay")
