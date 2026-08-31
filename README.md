@@ -10,8 +10,8 @@ to the API over HTTPS, so it never pulls in the server):
 ```bash
 pip install petabyte-client                          # the command it installs is `petabyte`
 export PETABYTE_API_URL=https://petabyte.market     # default; or pass --api / omit for localhost
-petabyte register -u alice -p secret
-petabyte login    -u alice -p secret
+export PETABYTE_API_KEY=pk_...                        # your account key — sign in on the web (Google),
+                                                     # create an 'account'-scoped key; no passwords
 petabyte deposit 100
 petabyte specs                                       # a readable, cheapest-first GPU table
 petabyte launch ollama --hours 2                     # one-click app: cheapest verified GPU, started

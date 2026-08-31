@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Petabyte CLI — book GPU compute and run a notebook in one command.
 
-  petabyte register -u alice -p secret
-  petabyte login    -u alice -p secret
+Authentication: export an account API key — sign in on the web (Google), create an
+'account'-scoped key, then `export PETABYTE_API_KEY=pk_…`. The CLI sends it on every
+request; there is no password login.
+
+  export PETABYTE_API_KEY=pk_...
   petabyte deposit 100
   petabyte specs
   petabyte launch ollama --hours 2
@@ -43,7 +46,7 @@ def _cfg():
     try:
         return json.load(open(CONFIG))
     except Exception:
-        return {"api_url": DEFAULT_API, "token": None}
+        return {"api_url": DEFAULT_API}
 
 
 def _save(cfg):
@@ -53,10 +56,18 @@ def _save(cfg):
     json.dump(cfg, open(CONFIG, "w"))
 
 
+def _api_key(cfg):
+    """The account API key used to authenticate. Export PETABYTE_API_KEY (an 'account'-scoped
+    key created while signed in on the web), or save it as `api_key` in your config file."""
+    return os.getenv("PETABYTE_API_KEY") or cfg.get("api_key")
+
+
 def _client(cfg, auth=True):
     headers = {}
-    if auth and cfg.get("token"):
-        headers["Authorization"] = f"Bearer {cfg['token']}"
+    if auth:
+        key = _api_key(cfg)
+        if key:                                 # sent as X-API-KEY; the API accepts an
+            headers["X-API-KEY"] = key          # 'account'-scoped key for every buyer endpoint
     return httpx.Client(base_url=cfg["api_url"], headers=headers, timeout=30)
 
 
@@ -67,20 +78,8 @@ def _die(msg, r=None):
     sys.exit(1)
 
 
-def cmd_register(a, cfg):
-    with _client(cfg, auth=False) as c:
-        r = c.post("/register_user", json={"username": a.username, "password": a.password})
-    print("registered" if r.status_code == 200 else _die("register failed", r))
-
-
-def cmd_login(a, cfg):
-    with _client(cfg, auth=False) as c:
-        r = c.post("/login", data={"username": a.username, "password": a.password})
-    if r.status_code != 200:
-        _die("login failed", r)
-    cfg["token"] = r.json()["access_token"]
-    _save(cfg)
-    print("logged in")
+# register/login were removed — the CLI authenticates with an exported PETABYTE_API_KEY
+# (see the module docstring). Create an account key while signed in on the web.
 
 
 def cmd_deposit(a, cfg):
@@ -353,8 +352,6 @@ def main():
     p.add_argument("--api", help="API base URL (overrides saved config)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    s = sub.add_parser("register"); s.add_argument("-u", "--username", required=True); s.add_argument("-p", "--password", required=True)
-    s = sub.add_parser("login");    s.add_argument("-u", "--username", required=True); s.add_argument("-p", "--password", required=True)
     s = sub.add_parser("deposit");  s.add_argument("amount", type=float)
     sub.add_parser("wallet")
     sub.add_parser("specs")
@@ -413,7 +410,7 @@ def main():
             id=a.file, format=a.format, quantization=a.quantization, revision=a.revision,
             force=a.force, home=None)
         sys.exit(mh_cli.cmd_run(ns) or 0)
-    {"register": cmd_register, "login": cmd_login, "deposit": cmd_deposit,
+    {"deposit": cmd_deposit,
      "wallet": cmd_wallet, "specs": cmd_specs, "run": cmd_run, "launch": cmd_launch, "vpn": cmd_vpn,
      "earnings": cmd_earnings, "node": cmd_node, "ask": cmd_ask}[a.cmd](a, cfg)
 
