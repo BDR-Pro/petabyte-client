@@ -29,8 +29,10 @@ class ConcurrentPullError(Exception):
 
 class ModelManager:
     def __init__(self, home=None, provider_factory=get_provider):
+        # NB: do NOT create the cache here. Construction must be side-effect-free so
+        # discovery (search/featured) works even where $HOME isn't writable. The cache
+        # is materialised lazily in pull() — the only path that writes to it.
         self.cache = Cache(home)
-        self.cache.ensure()
         self._provider_for = provider_factory
 
     # ---- discovery ----
@@ -58,6 +60,7 @@ class ModelManager:
     # ---- pull ----
     def pull(self, ref_or_str, *, fmt=None, quantization=None, revision=None, force=False,
              on_event=None, jobs=1, cancel=None):
+        self.cache.ensure()   # first write path — materialise the cache now
         ref = self._ref(ref_or_str)
         _emit(on_event, {"event": "resolving", "id": ref.id})
         manifest = self.resolve_manifest(ref, fmt=fmt, quantization=quantization, revision=revision)
