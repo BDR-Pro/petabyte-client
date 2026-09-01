@@ -9,7 +9,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "petabyte-client"
-version = "0.1.0"
+version = "0.2.0"
 description = "Petabyte CLI — rent verified GPU compute, launch apps, and pull AI models from your terminal."
 readme = "README.md"
 requires-python = ">=3.9"

@@ -65,9 +65,16 @@ def _api_key(cfg):
 def _client(cfg, auth=True):
     headers = {}
     if auth:
-        key = _api_key(cfg)
-        if key:                                 # sent as X-API-KEY; the API accepts an
-            headers["X-API-KEY"] = key          # 'account'-scoped key for every buyer endpoint
+        # Prefer a session token from browser `login` (or $PETABYTE_TOKEN for headless/CI) as a
+        # Bearer; otherwise fall back to an 'account'-scoped API key as X-API-KEY. The API accepts
+        # either for every buyer endpoint (deps.get_current_user).
+        tok = cfg.get("token") or os.getenv("PETABYTE_TOKEN")
+        if tok:
+            headers["Authorization"] = f"Bearer {tok}"
+        else:
+            key = _api_key(cfg)
+            if key:
+                headers["X-API-KEY"] = key
     return httpx.Client(base_url=cfg["api_url"], headers=headers, timeout=30)
 
 
@@ -78,8 +85,51 @@ def _die(msg, r=None):
     sys.exit(1)
 
 
-# register/login were removed — the CLI authenticates with an exported PETABYTE_API_KEY
-# (see the module docstring). Create an account key while signed in on the web.
+# Password login + /register_user were removed server-side (OAuth + API keys only). The CLI
+# authenticates with an exported PETABYTE_API_KEY (see the module docstring), or `login` runs the
+# browser device flow below to mint a session token — no password ever touches the CLI.
+def cmd_login(a, cfg):
+    return _login_web(cfg)
+
+
+def _login_web(cfg):
+    """OAuth-device-style browser login: start a request, open the approval page, poll for a token.
+    No password ever touches the CLI."""
+    import time as _t
+    import webbrowser
+    with _client(cfg, auth=False) as c:
+        r = c.post("/auth/cli/start")
+    if r.status_code != 200:
+        _die("could not start browser login", r)
+    d = r.json()
+    url = d.get("verification_uri_complete") or d.get("verification_uri")
+    print("Open this URL to authorize the CLI:\n  " + _cyan(url) +
+          "\nand confirm the code: " + _bold(d.get("user_code", "?")))
+    try:
+        webbrowser.open(url)
+    except Exception:
+        pass
+    interval = max(2, int(d.get("interval", 3)))
+    deadline = _t.time() + int(d.get("expires_in", 600))
+    print(_dim("waiting for approval in your browser… (Ctrl-C to cancel)"))
+    while _t.time() < deadline:
+        _t.sleep(interval)
+        try:
+            with _client(cfg, auth=False) as c:
+                pr = c.post("/auth/cli/poll", json={"device_code": d["device_code"]})
+        except Exception:
+            continue                              # transient network hiccup — keep polling
+        if pr.status_code != 200:
+            continue
+        st = pr.json().get("status")
+        if st == "approved":
+            cfg["token"] = pr.json()["access_token"]
+            _save(cfg)
+            print(_green("✓ logged in"))
+            return
+        if st in ("denied", "expired"):
+            _die(f"browser login {st} — run `petabyte login --web` again")
+    _die("browser login timed out — run it again")
 
 
 def cmd_deposit(a, cfg):
@@ -518,6 +568,9 @@ def main():
     p.add_argument("--api", help="API base URL (overrides saved config)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
+    s = sub.add_parser("login", help="authorize in the browser (device flow) — no password on "
+                                     "the CLI; token also via $PETABYTE_TOKEN")
+    s.add_argument("--web", action="store_true", help="(default) browser device-login")
     s = sub.add_parser("deposit");  s.add_argument("amount", type=float)
     sub.add_parser("wallet")
     sub.add_parser("specs")
@@ -596,7 +649,7 @@ def main():
             id=a.file, format=a.format, quantization=a.quantization, revision=a.revision,
             force=a.force, home=None)
         sys.exit(mh_cli.cmd_run(ns) or 0)
-    {"deposit": cmd_deposit,
+    {"deposit": cmd_deposit, "login": cmd_login,
      "wallet": cmd_wallet, "specs": cmd_specs, "run": cmd_run, "launch": cmd_launch, "vpn": cmd_vpn,
      "earnings": cmd_earnings, "node": cmd_node, "ask": cmd_ask,
      "render": cmd_render, "transcode": cmd_transcode}[a.cmd](a, cfg)
