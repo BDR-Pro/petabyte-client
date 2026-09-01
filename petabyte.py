@@ -401,6 +401,118 @@ def cmd_node(a, cfg):
     {"status": _node_status, "sync-models": _node_sync_models}[a.node_cmd](a, cfg)
 
 
+_JOB_DONE = {"complete", "done", "ok", "stitched", "succeeded"}
+_JOB_FAILED = {"failed", "error", "cancelled"}
+
+
+def _parse_frames(spec):
+    spec = (spec or "1-1").strip()
+    if "-" in spec:
+        a, b = spec.split("-", 1)
+        return int(a), int(b)
+    n = int(spec)
+    return n, n
+
+
+def _upload_input(c, path):
+    if not os.path.exists(path):
+        _die(f"file not found: {path}")
+    r = c.post("/uploads/url", json={"filename": os.path.basename(path)})
+    if r.status_code >= 300:
+        _die("could not get an upload URL", r)
+    up = r.json()
+    with open(path, "rb") as fh:
+        pr = httpx.put(up["upload_url"], content=fh.read(), timeout=1800)
+    if pr.status_code >= 300:
+        _die(f"upload failed ({pr.status_code})")
+    return up["ref"]
+
+
+def _poll_job(c, job_id, label):
+    seen = None
+    while True:
+        r = c.get(f"/jobs/manifest/{job_id}")
+        if r.status_code >= 300:
+            _die("could not read job status", r)
+        m = r.json()
+        segs = m.get("segments", [])
+        done = sum(1 for x in segs if str(x.get("status", "")).lower() in _JOB_DONE)
+        tot = m.get("total_segments") or len(segs) or 1
+        key = (done, m.get("status"))
+        if key != seen:
+            print(f"  {label}: {done}/{tot} segment(s) — {m.get('status')}")
+            seen = key
+        st = str(m.get("status", "")).lower()
+        if st in _JOB_DONE or st in _JOB_FAILED or (tot and done >= tot):
+            return m
+        time.sleep(4)
+
+
+def _download_outputs(c, job_id, outdir):
+    r = c.post("/jobs/output_url", json={"job_id": job_id})
+    if r.status_code >= 300:
+        _die("could not list outputs", r)
+    outs = r.json().get("outputs", [])
+    os.makedirs(outdir, exist_ok=True)
+    saved = []
+    for o in outs:
+        name = (o.get("output_ref", "").rstrip("/").split("/")[-1]) or f"seg{o.get('idx')}"
+        d = httpx.get(o["download_url"], timeout=1800)
+        if d.status_code < 300:
+            dst = os.path.join(outdir, name)
+            with open(dst, "wb") as fh:
+                fh.write(d.content)
+            saved.append(dst)
+    return saved
+
+
+def cmd_render(a, cfg):
+    """Drop a .blend, render on the farm, pay only for render time, download the frames."""
+    fs, fe = _parse_frames(a.frames)
+    with _client(cfg) as c:
+        print(_dim(f"uploading {os.path.basename(a.file)} …"))
+        ref = _upload_input(c, a.file)
+        r = c.post("/render", json={"blend_ref": ref, "frame_start": fs, "frame_end": fe,
+                                    "samples": a.samples, "nodes": a.nodes, "hours": a.hours})
+        if r.status_code >= 300:
+            _die("render request failed", r)
+        d = r.json()
+        print(_green("✓ render started  ")
+              + f"job #{d['job_id']} · {d['nodes']} node(s) · frames {fs}-{fe}")
+        print("  " + _bold(f"~${d.get('estimated_cost')}")
+              + _dim(" max — you're billed only for actual render time"))
+        m = _poll_job(c, d["job_id"], "render")
+        if str(m.get("status", "")).lower() in _JOB_FAILED:
+            _die("render job failed")
+        saved = _download_outputs(c, d["job_id"], a.out)
+        print(_green(f"✓ {len(saved)} frame(s) → {a.out}") if saved
+              else _amber("job finished but no outputs were ready — re-run to fetch later"))
+
+
+def cmd_transcode(a, cfg):
+    """Drop a video, GPU-transcode it (NVENC), download the result."""
+    with _client(cfg) as c:
+        print(_dim(f"uploading {os.path.basename(a.file)} …"))
+        ref = _upload_input(c, a.file)
+        body = {"input_ref": ref, "codec": a.codec, "container": a.container, "use_gpu": True}
+        if a.resolution:
+            body["resolution"] = a.resolution
+        if a.crf is not None:
+            body["crf"] = a.crf
+        r = c.post("/transcode", json=body)
+        if r.status_code >= 300:
+            _die("transcode request failed", r)
+        d = r.json()
+        print(_green("✓ transcode started  ") + f"job #{d.get('job_id')}")
+        if d.get("estimated_cost") is not None:
+            print("  " + _bold(f"~${d.get('estimated_cost')}") + _dim(" max — billed for actual time"))
+        m = _poll_job(c, d["job_id"], "transcode")
+        if str(m.get("status", "")).lower() in _JOB_FAILED:
+            _die("transcode job failed")
+        saved = _download_outputs(c, d["job_id"], a.out)
+        print(_green(f"✓ output → {a.out}") if saved else _amber("finished; no output ready yet"))
+
+
 def main():
     p = argparse.ArgumentParser(prog="petabyte")
     p.add_argument("--api", help="API base URL (overrides saved config)")
@@ -449,6 +561,22 @@ def main():
                        help="scan the local ~/.petabyte cache and report it to the marketplace")
     sm.add_argument("spec_id", type=int)
 
+    s = sub.add_parser("render", help="render a .blend on the GPU farm — pay only for render time")
+    s.add_argument("file", help="path to a .blend scene")
+    s.add_argument("--frames", default="1-1", help="frame range, e.g. 1-120 or 5")
+    s.add_argument("--samples", type=int, default=128)
+    s.add_argument("--nodes", type=int, default=1, help="split the frame range across N nodes")
+    s.add_argument("--hours", type=int, default=1, help="max hours to escrow (unused is refunded)")
+    s.add_argument("--out", default="./renders", help="download frames here")
+
+    s = sub.add_parser("transcode", help="GPU-transcode a video (NVENC) — drop a file, get it back")
+    s.add_argument("file", help="path to a source video")
+    s.add_argument("--codec", default="h264", help="h264|h265|av1|vp9")
+    s.add_argument("--resolution", help="e.g. 1920x1080")
+    s.add_argument("--crf", type=int, help="quality 0-51 (lower = better)")
+    s.add_argument("--container", default="mp4", help="mp4|mkv|webm|mov|…")
+    s.add_argument("--out", default="./transcoded", help="download output here")
+
     # model hub: discover/pull/manage AI models (Hugging Face-grade UX). Owns `model`, `pull`, `auth`;
     # `run` is shared with the compute flow above and dispatched smartly below.
     if mh_cli is not None:
@@ -470,7 +598,8 @@ def main():
         sys.exit(mh_cli.cmd_run(ns) or 0)
     {"deposit": cmd_deposit,
      "wallet": cmd_wallet, "specs": cmd_specs, "run": cmd_run, "launch": cmd_launch, "vpn": cmd_vpn,
-     "earnings": cmd_earnings, "node": cmd_node, "ask": cmd_ask}[a.cmd](a, cfg)
+     "earnings": cmd_earnings, "node": cmd_node, "ask": cmd_ask,
+     "render": cmd_render, "transcode": cmd_transcode}[a.cmd](a, cfg)
 
 
 def _is_model_ref(arg):
