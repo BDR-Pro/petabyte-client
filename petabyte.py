@@ -126,8 +126,62 @@ def _read_code(path):
     return open(path).read()
 
 
-def cmd_run(a, cfg):
+def _bundle_project(entry, max_bytes=25 * 1024 * 1024):
+    """tar.gz the entry's project folder (siblings + subpackages), skipping junk and
+    files >8MB, and return (base64, entry_relpath) — or None if it's a lone file or
+    the bundled code exceeds max_bytes (mount/download big data separately)."""
+    import tarfile, io, base64
+    entry = os.path.abspath(entry)
+    root = os.path.dirname(entry) or "."
+    IGNORE = {".git", "__pycache__", ".venv", "venv", "env", "node_modules", ".mypy_cache",
+              ".ipynb_checkpoints", ".pytest_cache", "dist", "build", ".idea", ".vscode"}
+    buf = io.BytesIO(); total = 0
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for dirpath, dirs, files in os.walk(root):
+            dirs[:] = [d for d in dirs if d not in IGNORE and not d.startswith(".")]
+            for fn in files:
+                if fn.endswith((".pyc", ".pyo")) or fn.startswith("."):
+                    continue
+                fp = os.path.join(dirpath, fn)
+                try:
+                    sz = os.path.getsize(fp)
+                except OSError:
+                    continue
+                if sz > 8 * 1024 * 1024:            # skip big data — not source
+                    continue
+                total += sz
+                if total > max_bytes:
+                    return None
+                tar.add(fp, arcname=os.path.relpath(fp, root))
+    return base64.b64encode(buf.getvalue()).decode(), os.path.relpath(entry, root)
+
+
+def _run_payload(a):
+    """The notebook `code` payload for `run`: a JSON project bundle when the entry has
+    local dependencies, else the plain single-file source (unchanged behaviour)."""
     code = _read_code(a.file)
+    if getattr(a, "deps", None) is False:          # --no-deps: force single file
+        return code
+    root = os.path.dirname(os.path.abspath(a.file)) or "."
+    try:
+        siblings = [x for x in os.listdir(root)
+                    if x.endswith(".py") and os.path.join(root, x) != os.path.abspath(a.file)]
+    except OSError:
+        siblings = []
+    auto = bool(siblings) or os.path.exists(os.path.join(root, "requirements.txt"))
+    if getattr(a, "deps", None) is True or auto:
+        b = _bundle_project(a.file)
+        if b is None:
+            print(_amber("! project code exceeds 25MB — running the single file only "
+                         "(mount or download large data from your script)"))
+            return code
+        b64, entry = b
+        print(_dim(f"→ bundling project ({len(b64) // 1024} KB, entry {entry})"))
+        return json.dumps({"bundle_b64": b64, "entry": entry, "gpu": bool(getattr(a, "gpu", None))})
+    return code
+
+
+def cmd_run(a, cfg):
     with _client(cfg) as c:
         # pick a spec
         spec_id = a.spec
@@ -162,7 +216,7 @@ def cmd_run(a, cfg):
                 print(_amber("! could not fetch VPN config (booking still active)"))
         # create task
         r = c.post("/create_task", json={"booking_id": bk["booking_id"],
-                                         "task_type": "notebook", "code": code})
+                                         "task_type": "notebook", "code": _run_payload(a)})
         if r.status_code != 200:
             _die("task creation failed", r)
         tid = r.json()["task_id"]
@@ -356,6 +410,10 @@ def main():
     sub.add_parser("wallet")
     sub.add_parser("specs")
     s = sub.add_parser("run", help="run a notebook/.py on a rented GPU, OR start a model runtime")
+    s.add_argument("--deps", dest="deps", action="store_true", default=None,
+                   help="bundle the whole project folder (auto when siblings/requirements.txt exist)")
+    s.add_argument("--no-deps", dest="deps", action="store_false",
+                   help="ship only the single file")
     s.add_argument("file", help="a .ipynb/.py file (compute job) OR a model id like Qwen/Qwen3-8B")
     s.add_argument("--spec", type=int); s.add_argument("--gpu")
     s.add_argument("--hours", type=int, default=1); s.add_argument("--timeout", type=int, default=120)
