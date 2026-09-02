@@ -78,9 +78,32 @@ def _client(cfg, auth=True):
     return httpx.Client(base_url=cfg["api_url"], headers=headers, timeout=30)
 
 
+def _humanize_error(r):
+    """Pull a clean, human message out of a server error response instead of dumping raw
+    JSON at the user. Handles our {"error":{"message":…}} / {"detail":…} envelopes and
+    FastAPI's 422 validation list; falls back to the raw body. Keeps the request_id when
+    present so a report is still traceable."""
+    try:
+        j = r.json()
+    except Exception:                       # noqa: BLE001 — non-JSON body
+        return (r.text or "").strip()[:200]
+    err = j.get("error") if isinstance(j, dict) else None
+    msg = (err or {}).get("message") if isinstance(err, dict) else None
+    detail = j.get("detail") if isinstance(j, dict) else None
+    if isinstance(detail, list):            # FastAPI/pydantic 422 → "field: message; …"
+        parts = []
+        for e in detail:
+            loc = ".".join(str(p) for p in (e.get("loc") or [])[1:]) or "input"
+            parts.append(f"{loc}: {e.get('msg')}")
+        detail = "; ".join(parts)
+    out = msg or (detail if isinstance(detail, str) else None) or (r.text or "").strip()[:200]
+    rid = (err or {}).get("request_id") if isinstance(err, dict) else None
+    return f"{out}  [req {rid}]" if rid else out
+
+
 def _die(msg, r=None):
     if r is not None:
-        msg += f" ({r.status_code}: {r.text[:200]})"
+        msg += f" ({r.status_code}: {_humanize_error(r)})"
     print(f"error: {msg}", file=sys.stderr)
     sys.exit(1)
 
@@ -169,6 +192,8 @@ def cmd_specs(a, cfg):
 
 
 def _read_code(path):
+    if not os.path.isfile(path):
+        _die(f"file not found: {path}")
     if path.endswith(".ipynb"):
         nb = json.load(open(path))
         cells = [c for c in nb.get("cells", []) if c.get("cell_type") == "code"]
@@ -176,21 +201,41 @@ def _read_code(path):
     return open(path).read()
 
 
+# Files that must NEVER be shipped to a seller node even if they sit next to the entry
+# script. Hidden files (.env, .netrc, …) are already skipped; this catches the non-dotfile
+# credential names/suffixes that a plain `os.walk` would otherwise sweep up.
+_SECRET_SUFFIXES = (".pem", ".key", ".ppk", ".pfx", ".p12", ".jks", ".keystore",
+                    ".kdbx", ".ovpn", ".asc", ".gpg")
+_SECRET_SUBSTRINGS = ("secret", "credential", "password", "_key", "apikey", "api_key",
+                      "id_rsa", "id_ed25519", "id_ecdsa", "token")
+_SECRET_EXACT = {"credentials", "credentials.json", ".env", ".netrc", ".git-credentials",
+                 "cli.json", ".pgpass", ".dockercfg"}
+
+
+def _looks_secret(filename):
+    low = filename.lower()
+    return (low in _SECRET_EXACT
+            or low.endswith(_SECRET_SUFFIXES)
+            or any(s in low for s in _SECRET_SUBSTRINGS))
+
+
 def _bundle_project(entry, max_bytes=25 * 1024 * 1024):
-    """tar.gz the entry's project folder (siblings + subpackages), skipping junk and
-    files >8MB, and return (base64, entry_relpath) — or None if it's a lone file or
-    the bundled code exceeds max_bytes (mount/download big data separately)."""
+    """tar.gz the entry's project folder (siblings + subpackages), skipping junk, secrets
+    and files >8MB, and return (base64, entry_relpath, included_names) — or None if it's a
+    lone file or the bundled code exceeds max_bytes (mount/download big data separately)."""
     import tarfile, io, base64
     entry = os.path.abspath(entry)
     root = os.path.dirname(entry) or "."
     IGNORE = {".git", "__pycache__", ".venv", "venv", "env", "node_modules", ".mypy_cache",
               ".ipynb_checkpoints", ".pytest_cache", "dist", "build", ".idea", ".vscode"}
-    buf = io.BytesIO(); total = 0
+    buf = io.BytesIO(); total = 0; included = []
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
         for dirpath, dirs, files in os.walk(root):
             dirs[:] = [d for d in dirs if d not in IGNORE and not d.startswith(".")]
             for fn in files:
                 if fn.endswith((".pyc", ".pyo")) or fn.startswith("."):
+                    continue
+                if _looks_secret(fn):              # never ship credentials to the seller
                     continue
                 fp = os.path.join(dirpath, fn)
                 try:
@@ -202,8 +247,10 @@ def _bundle_project(entry, max_bytes=25 * 1024 * 1024):
                 total += sz
                 if total > max_bytes:
                     return None
-                tar.add(fp, arcname=os.path.relpath(fp, root))
-    return base64.b64encode(buf.getvalue()).decode(), os.path.relpath(entry, root)
+                rel = os.path.relpath(fp, root)
+                tar.add(fp, arcname=rel)
+                included.append(rel)
+    return base64.b64encode(buf.getvalue()).decode(), os.path.relpath(entry, root), included
 
 
 def _run_payload(a):
@@ -225,13 +272,18 @@ def _run_payload(a):
             print(_amber("! project code exceeds 25MB — running the single file only "
                          "(mount or download large data from your script)"))
             return code
-        b64, entry = b
-        print(_dim(f"→ bundling project ({len(b64) // 1024} KB, entry {entry})"))
+        b64, entry, included = b
+        shown = ", ".join(included[:8]) + (f" +{len(included) - 8} more" if len(included) > 8 else "")
+        print(_dim(f"→ bundling {len(included)} file(s) to the seller "
+                   f"({len(b64) // 1024} KB, entry {entry}): {shown}"))
         return json.dumps({"bundle_b64": b64, "entry": entry, "gpu": bool(getattr(a, "gpu", None))})
     return code
 
 
 def cmd_run(a, cfg):
+    # Read/bundle the code BEFORE booking. If the file is missing or the bundle fails, we exit
+    # here — never after a booking, which would escrow money for a job we can't even submit.
+    payload = _run_payload(a)
     with _client(cfg) as c:
         # pick a spec
         spec_id = a.spec
@@ -264,9 +316,9 @@ def cmd_run(a, cfg):
                       _dim(f"  → connect with:  sudo wg-quick up ./{path}"))
             else:
                 print(_amber("! could not fetch VPN config (booking still active)"))
-        # create task
+        # create task (payload was read/bundled up-front, before we spent anything)
         r = c.post("/create_task", json={"booking_id": bk["booking_id"],
-                                         "task_type": "notebook", "code": _run_payload(a)})
+                                         "task_type": "notebook", "code": payload})
         if r.status_code != 200:
             _die("task creation failed", r)
         tid = r.json()["task_id"]
@@ -467,6 +519,7 @@ def _parse_frames(spec):
 def _upload_input(c, path):
     if not os.path.exists(path):
         _die(f"file not found: {path}")
+    print(_dim(f"uploading {os.path.basename(path)} …"))   # only after we know the file is real
     r = c.post("/uploads/url", json={"filename": os.path.basename(path)})
     if r.status_code >= 300:
         _die("could not get an upload URL", r)
@@ -520,7 +573,6 @@ def cmd_render(a, cfg):
     """Drop a .blend, render on the farm, pay only for render time, download the frames."""
     fs, fe = _parse_frames(a.frames)
     with _client(cfg) as c:
-        print(_dim(f"uploading {os.path.basename(a.file)} …"))
         ref = _upload_input(c, a.file)
         r = c.post("/render", json={"blend_ref": ref, "frame_start": fs, "frame_end": fe,
                                     "samples": a.samples, "nodes": a.nodes, "hours": a.hours})
@@ -542,7 +594,6 @@ def cmd_render(a, cfg):
 def cmd_transcode(a, cfg):
     """Drop a video, GPU-transcode it (NVENC), download the result."""
     with _client(cfg) as c:
-        print(_dim(f"uploading {os.path.basename(a.file)} …"))
         ref = _upload_input(c, a.file)
         body = {"input_ref": ref, "codec": a.codec, "container": a.container, "use_gpu": True}
         if a.resolution:
@@ -580,12 +631,18 @@ def main():
     s.add_argument("--no-deps", dest="deps", action="store_false",
                    help="ship only the single file")
     s.add_argument("file", help="a .ipynb/.py file (compute job) OR a model id like Qwen/Qwen3-8B")
-    s.add_argument("--spec", type=int); s.add_argument("--gpu")
-    s.add_argument("--hours", type=int, default=1); s.add_argument("--timeout", type=int, default=120)
+    s.add_argument("--spec", type=int, help="pin to a specific host spec id (default: cheapest match)")
+    s.add_argument("--gpu", help="require this GPU model, e.g. 'NVIDIA H100' (also runs the job in a "
+                                 "CUDA container); default: cheapest available")
+    s.add_argument("--hours", type=int, default=1, help="max hours to escrow (unused is refunded)")
+    s.add_argument("--timeout", type=int, default=120,
+                   help="seconds to wait for the result before giving up (default: 120)")
     s.add_argument("--vpn", action="store_true",
                    help="rent on a private WireGuard VPN and save the client config")
-    s.add_argument("--revision"); s.add_argument("--format"); s.add_argument("--quantization")
-    s.add_argument("--force", action="store_true")
+    s.add_argument("--revision", help="model runtime: git revision/branch to serve (model-id runs only)")
+    s.add_argument("--format", help="model runtime: weight format, e.g. safetensors/gguf (model-id runs only)")
+    s.add_argument("--quantization", help="model runtime: quantization, e.g. q4_k_m/awq (model-id runs only)")
+    s.add_argument("--force", action="store_true", help="model runtime: re-pull even if already cached")
     s = sub.add_parser("launch",
                        help="launch a ready-made template (ollama, jupyter, blender, minecraft…) on the cheapest verified GPU")
     s.add_argument("template", help="template name, e.g. ollama, jupyter, blender, minecraft")
