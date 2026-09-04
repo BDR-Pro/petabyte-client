@@ -39,7 +39,10 @@ def _dim(t): return _c(t, "2")
 def _bold(t): return _c(t, "1")
 
 CONFIG = os.getenv("PETABYTE_CONFIG") or os.path.expanduser("~/.petabyte/cli.json")
-DEFAULT_API = os.getenv("PETABYTE_API_URL", "http://localhost:8000")
+# Default to the production service so a fresh `pip install petabyte-client` just works
+# (`petabyte login` hits the real API). Point at test/local with $PETABYTE_API_URL or --api,
+# e.g. PETABYTE_API_URL=http://localhost:8000 for a dev server.
+DEFAULT_API = os.getenv("PETABYTE_API_URL", "https://petabyte.market")
 
 
 def _cfg():
@@ -204,10 +207,18 @@ def _read_code(path):
 # Files that must NEVER be shipped to a seller node even if they sit next to the entry
 # script. Hidden files (.env, .netrc, …) are already skipped; this catches the non-dotfile
 # credential names/suffixes that a plain `os.walk` would otherwise sweep up.
+import re as _re_secret
+
 _SECRET_SUFFIXES = (".pem", ".key", ".ppk", ".pfx", ".p12", ".jks", ".keystore",
                     ".kdbx", ".ovpn", ".asc", ".gpg")
 _SECRET_SUBSTRINGS = ("secret", "credential", "password", "_key", "apikey", "api_key",
-                      "id_rsa", "id_ed25519", "id_ecdsa", "token")
+                      "id_rsa", "id_ed25519", "id_ecdsa")
+# "token" as a BARE substring matched tokenizer.py, detokenizer.py, tokenize_utils.py -- about the
+# most likely filenames in a real ML job. Those were silently dropped from the bundle, so the job
+# booked (money taken), uploaded, then died remotely with an ImportError the buyer could not
+# explain. Bound it to a whole path segment instead: token.py / auth_token.json / api-token still
+# match; tokenizer.py does not.
+_SECRET_WORD_RE = _re_secret.compile(r"(?:^|[^a-z0-9])tokens?(?:[^a-z0-9]|$)")
 _SECRET_EXACT = {"credentials", "credentials.json", ".env", ".netrc", ".git-credentials",
                  "cli.json", ".pgpass", ".dockercfg"}
 
@@ -216,7 +227,8 @@ def _looks_secret(filename):
     low = filename.lower()
     return (low in _SECRET_EXACT
             or low.endswith(_SECRET_SUFFIXES)
-            or any(s in low for s in _SECRET_SUBSTRINGS))
+            or any(s in low for s in _SECRET_SUBSTRINGS)
+            or bool(_SECRET_WORD_RE.search(low)))
 
 
 def _bundle_project(entry, max_bytes=25 * 1024 * 1024):

@@ -9,7 +9,8 @@ Installed from PyPI, the `petabyte` command is a thin client (only needs `httpx`
 to the API over HTTPS, so it never pulls in the server):
 ```bash
 pip install petabyte-client                          # the command it installs is `petabyte`
-export PETABYTE_API_URL=https://petabyte.market     # default; or pass --api / omit for localhost
+# Talks to https://petabyte.market by default — nothing to configure. Point at a
+# test/local server with:  export PETABYTE_API_URL=http://localhost:8000  (or pass --api URL)
 export PETABYTE_API_KEY=pk_...                        # your account key — sign in on the web (Google),
                                                      # create an 'account'-scoped key; no passwords
 petabyte deposit 100
@@ -41,8 +42,9 @@ polls, and prints the result. `.ipynb` (code cells) and `.py` files are supporte
   aligned tables. Colour turns **off** automatically when stdout is not a TTY or `NO_COLOR`
   is set — safe for scripts and CI. The buyer `petabyte` client uses its own small inline
   colour helpers (no dependency beyond `httpx`); it does **not** import `cli_ui.py`.
-- `PETABYTE_API_URL` (or `--api`) selects the API; `PETABYTE_CONFIG=/path/cli.json`
-  isolates the saved token/API (handy in CI or tests).
+- `PETABYTE_API_URL` (or `--api`) selects the API — defaults to `https://petabyte.market`;
+  set it to `http://localhost:8000` (or any test host) to point at a non-production server.
+  `PETABYTE_CONFIG=/path/cli.json` isolates the saved token/API (handy in CI or tests).
 
 > Note: a stable `--json`/`PETABYTE_JSON` machine-readable mode and a `doctor`
 > health-gate command exist in the **seller agent CLI** (`lumaris_agent/agent_cli.py`),
